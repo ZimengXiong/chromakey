@@ -114,6 +114,71 @@ func element(_ root: AXUIElement, _ key: String) -> AXUIElement? {
     guard let value = attribute(root, key), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
     return (value as! AXUIElement)
 }
+func runningBrowser(_ browserID: String) -> NSRunningApplication? {
+    NSWorkspace.shared.runningApplications.first {
+        $0.bundleIdentifier == browserID && supportedBrowser($0) != nil && !$0.isTerminated
+    }
+}
+// Chromium only exposes web content (the extension popup) to accessibility clients that ask for
+// it via AXEnhancedUserInterface; without it, a freshly launched browser reports no focused
+// element and no AXWebArea. Enabled only while a code is pending, then switched back off.
+var enhancedPIDs = Set<pid_t>()
+func enableWebAccessibility(for browserID: String) {
+    guard let app = runningBrowser(browserID), !enhancedPIDs.contains(app.processIdentifier) else { return }
+    let root = AXUIElementCreateApplication(app.processIdentifier)
+    if (attribute(root, "AXEnhancedUserInterface") as? Bool) == true { return }
+    // Chromium applies this but may still report kAXErrorNotImplemented, so track it regardless.
+    AXUIElementSetAttributeValue(root, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+    enhancedPIDs.insert(app.processIdentifier)
+}
+func releaseWebAccessibility() {
+    for pid in enhancedPIDs {
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(pid), "AXEnhancedUserInterface" as CFString,
+                                     kCFBooleanFalse)
+    }
+    enhancedPIDs.removeAll()
+}
+// On macOS 15 the helper's "Verification Code" window becomes the active app, so the browser is
+// no longer frontmost and no PIN field has focus. Bring the browser back and focus the next
+// empty PIN field in the extension prompt so destination() can find it.
+func focusPrompt(for browserID: String) {
+    guard let app = runningBrowser(browserID) else { return }
+    let root = AXUIElementCreateApplication(app.processIdentifier)
+    AXUIElementSetMessagingTimeout(root, 0.75)
+    enableWebAccessibility(for: browserID)
+    if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
+        AXUIElementSetAttributeValue(root, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        app.activate()
+    }
+    var visited = 0
+    func area(_ node: AXUIElement, _ depth: Int) -> AXUIElement? {
+        guard depth < 24, visited < 2000 else { return nil }
+        visited += 1
+        if text(node, kAXRoleAttribute) == "AXWebArea" {
+            let rawURL = attribute(node, kAXURLAttribute)
+            let url = (rawURL as? URL)?.absoluteString ?? (rawURL as? String ?? "")
+            return validPromptURL(url) && text(node, kAXTitleAttribute) == "iCloud Passwords" ? node : nil
+        }
+        for child in attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? [] {
+            if let found = area(child, depth + 1) { return found }
+        }
+        return nil
+    }
+    guard let prompt = (attribute(root, kAXWindowsAttribute) as? [AXUIElement] ?? []).lazy
+        .compactMap({ area($0, 0) }).first else { return }
+    if let window = element(prompt, kAXWindowAttribute) {
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+    var fields: [AXUIElement] = []
+    func walk(_ node: AXUIElement, _ depth: Int) {
+        guard depth < 20, fields.count < 7 else { return }
+        if text(node, kAXRoleAttribute) == kAXTextFieldRole { fields.append(node) }
+        for child in attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? [] { walk(child, depth + 1) }
+    }
+    walk(prompt, 0)
+    guard fields.count == 6, let next = fields.first(where: { text($0, kAXValueAttribute).isEmpty }) else { return }
+    AXUIElementSetAttributeValue(next, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+}
 func destination() -> Destination? {
     guard let app = NSWorkspace.shared.frontmostApplication,
           let browser = supportedBrowser(app),
@@ -157,6 +222,15 @@ func destination() -> Destination? {
 
 final class OverlayClickSurface: NSView {
     var onClick: (() -> Void)?
+    var onHover: ((Bool) -> Void)?
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { onHover?(true) }
+    override func mouseExited(with event: NSEvent) { onHover?(false) }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var acceptsFirstResponder: Bool { false }
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -207,7 +281,15 @@ final class HUD: NSPanel {
         clickSurface.frame = contentView!.bounds
         clickSurface.autoresizingMask = [.width, .height]
         clickSurface.onClick = { [weak self] in self?.onFill?() }
+        clickSurface.onHover = { [weak self] in self?.highlight($0) }
         contentView!.addSubview(clickSurface)
+    }
+    func highlight(_ hovered: Bool) {
+        contentView?.layer?.backgroundColor = NSColor(white: hovered ? 0.24 : 0.16, alpha: 1).cgColor
+    }
+    override func orderOut(_ sender: Any?) {
+        highlight(false)
+        super.orderOut(sender)
     }
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
@@ -442,8 +524,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func refresh() {
         guard !busy else { return }
         defer { updateTimer() }
-        guard enabled else { clear(); handled = nil; return }
-        guard let found = discover(in: helpers, for: supportedBrowser(NSWorkspace.shared.frontmostApplication)?.identifier) else { clear(); handled = nil; return }
+        guard enabled else { clear(); handled = nil; releaseWebAccessibility(); return }
+        guard let found = discover(in: helpers, for: supportedBrowser(NSWorkspace.shared.frontmostApplication)?.identifier) else {
+            clear(); handled = nil; releaseWebAccessibility(); return
+        }
         if handled?.matches(found) == true { return }
         if pending?.matches(found) == true {
             hud?.show(below: found.window)
@@ -451,6 +535,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         clear()
         pending = found
+        enableWebAccessibility(for: found.browserID)
         _ = bind(1, UInt32(kVK_Return), UInt32(cmdKey), &approveKey)
         watch(found.window)
         if hud == nil {
@@ -461,12 +546,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func scan() { handled = nil; clear(); connect() }
     func approve() {
-        guard !busy, let found = pending, let target = destination(),
-              target.browserID == found.browserID,
-              validPrefix(target.values, code: found.code, index: target.index) else { return }
+        guard !busy, let found = pending else { return }
+        if let target = destination() {
+            guard target.browserID == found.browserID,
+                  validPrefix(target.values, code: found.code, index: target.index) else { return }
+            busy = true
+            clear()
+            waitForRelease(found, target, 0)
+            return
+        }
+        // The prompt is not focused (e.g. the helper window took focus on macOS 15):
+        // refocus it and retry for up to ~1s.
         busy = true
-        clear()
-        waitForRelease(found, target, 0)
+        focusPrompt(for: found.browserID)
+        retryApprove(found, 0)
+    }
+    func retryApprove(_ found: Discovery, _ attempts: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            guard self.pending?.matches(found) == true else { self.finish(); return }
+            guard let target = destination() else {
+                if attempts < 20 {
+                    if attempts % 5 == 4 { focusPrompt(for: found.browserID) }
+                    self.retryApprove(found, attempts + 1)
+                } else { self.finish() }
+                return
+            }
+            guard target.browserID == found.browserID,
+                  validPrefix(target.values, code: found.code, index: target.index) else { self.finish(); return }
+            self.clear()
+            self.waitForRelease(found, target, 0)
+        }
     }
     func waitForRelease(_ found: Discovery, _ target: Destination, _ attempts: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
